@@ -27,7 +27,9 @@ ends early on any other response is still `MalformedResponse`.
 
 ## Fix 2: the trailer frame reaches tonic (`trailers.patch`)
 
-Found and reproduced by Crackdevs (https://github.com/Crackdevs/zcash-browser-ohttp-proof).
+Found, reproduced and first fixed by Crackdevs in their browser OHTTP proof
+(https://github.com/Crackdevs/zcash-browser-ohttp-proof). That repository has no licence file, so
+none of their code is used here; this fix was written separately.
 
 ### Why
 
