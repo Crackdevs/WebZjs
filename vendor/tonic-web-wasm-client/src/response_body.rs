@@ -130,8 +130,20 @@ impl ResponseBody {
         let body_stream =
             wasm_streams::ReadableStream::from_raw(body_stream.unchecked_into()).into_stream();
 
+        Self::from_body_stream(
+            BodyStream::new(body_stream, abort),
+            content_type,
+            trailers_only,
+        )
+    }
+
+    fn from_body_stream(
+        body_stream: BodyStream,
+        content_type: &str,
+        trailers_only: bool,
+    ) -> Result<Self, Error> {
         Ok(Self {
-            body_stream: BodyStream::new(body_stream, abort),
+            body_stream,
             buf: EncodedBytes::new(content_type)?,
             incomplete_data: BytesMut::new(),
             data: None,
@@ -342,3 +354,6 @@ impl Default for ResponseBody {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
