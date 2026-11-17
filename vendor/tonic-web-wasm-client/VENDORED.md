@@ -70,7 +70,7 @@ and the [follow-up proposed by Daniel/Konclave](https://github.com/Crackdevs/zca
 - Emit complete data frames as they are read. After parsing the trailer, wait for HTTP body EOF
   before yielding it once. Reject buffered or later bytes beyond that frame and surface any stream
   error while awaiting EOF. A pending body read uses the ordinary stream waker and the existing
-  fetch cancellation and deadline behavior.
+  fetch cancellation and deadline behavior. WebZjs currently constructs this client without a request timeout. If a server leaves the response body open after the trailer, the call can remain pending until the body ends, a transport error occurs, or the request is cancelled.
 - Require one `grpc-status` field in the body trailer. Reject duplicates after header-name
   normalization, missing status and values other than decimal ASCII without leading zeros. Tonic
   receives the original value, message and other metadata. Its bytewise status decoder preserves
