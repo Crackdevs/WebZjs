@@ -1,11 +1,9 @@
-# Vendored `tonic-web-wasm-client` 0.8.0, with two fixes
+# Vendored `tonic-web-wasm-client` 0.8.0
 
 This is `tonic-web-wasm-client` 0.8.0 from crates.io (MIT/Apache-2.0, see the licence files) with
-the changes in `trailers-only.patch` and then `trailers.patch`, wired in through
-`[patch.crates-io]` in the workspace `Cargo.toml`. The unit tests in `src/response_body/` are ours.
-`trailers.patch` carries only their two `cfg(test)` hooks (`mod tests;` and
-`BodyStream::from_chunks`), not the test files, so on a plain upstream checkout the patched crate
-builds but `cargo test` needs `src/response_body/` copied too.
+the patches below, wired in through `[patch.crates-io]` in the workspace `Cargo.toml`.
+The patches carry the `cfg(test)` hooks. Copy `src/response_body/` from this directory to run
+the tests, including Daniel/Konclave's tests and captured fixtures from WebZjs #28.
 
 ## Fix 1: trailers-only responses (`trailers-only.patch`)
 
@@ -27,9 +25,10 @@ ends early on any other response is still `MalformedResponse`.
 
 ## Fix 2: the trailer frame reaches tonic (`trailers.patch`)
 
-Found, reproduced and first fixed by Crackdevs in their browser OHTTP proof
-(https://github.com/Crackdevs/zcash-browser-ohttp-proof). That repository has no licence file, so
-none of their code is used here; this fix was written separately.
+Crackdevs found, reproduced and first fixed the lost trailer in their browser OHTTP proof
+(https://github.com/Crackdevs/zcash-browser-ohttp-proof). Daniel/Konclave prepared the minimal
+WebZjs backport in [#28](https://github.com/red-dev-inc/WebZjs/pull/28) using the upstream fixes
+credited below.
 
 ### Why
 
@@ -46,7 +45,7 @@ so without this fix a `cargo update` of tonic would fail every call that has a b
 
 ### The change
 
-- After the last data frame the body yields the parsed trailers as one trailers frame, then ends.
+- After the last data frame the body yields the parsed trailers as one trailers frame.
   This is the `src/response_body.rs` part of upstream commit 0f232d33
   (https://github.com/devashishdxt/tonic-web-wasm-client/pull/90, released in 0.9.1).
 - The body counts as finished only once the trailer frame has been read in full. A trailer frame
@@ -63,15 +62,40 @@ Behaviour that changes besides the fix: a trailer block that does not parse now 
 silently); and since body trailers now reach tonic, an invalid `grpc-status-details-bin` there hits
 the same tonic handling as one in the HTTP headers.
 
-Known and not changed: a response with `grpc-status: 0` in the headers and an error in a body
-trailer still reports success (tonic does not read the body then); repeated trailer keys keep only
-the last value (upstream issue 103); bytes after the trailer frame are ignored; like a data frame,
-a trailer frame is buffered until its announced length has arrived.
+## Fix 3: validate the body trailer and wait for EOF (`trailers-completion.patch`)
 
-### Tests
+This follows the decoder behavior from the [Crackdevs proof](https://github.com/Crackdevs/zcash-browser-ohttp-proof/blob/main/continuation-02/wallet.patch)
+and the [follow-up proposed by Daniel/Konclave](https://github.com/Crackdevs/zcash-browser-ohttp-proof/issues/1#issuecomment-6898562403).
 
-`cargo test --locked -p tonic-web-wasm-client` from the workspace root runs them natively against
-the workspace lock (CI: the `vendored-tonic-web-wasm-client` job in `rust-checks.yml`).
+- Emit complete data frames as they are read. After parsing the trailer, wait for HTTP body EOF
+  before yielding it once. Reject buffered or later bytes beyond that frame and surface any stream
+  error while awaiting EOF. A pending body read uses the ordinary stream waker and the existing
+  fetch cancellation and deadline behavior.
+- Require one `grpc-status` field in the body trailer. Reject duplicates after header-name
+  normalization, missing status and values other than decimal ASCII without leading zeros. Tonic
+  receives the original value, message and other metadata. Its bytewise status decoder preserves
+  codes 0–16 and maps unrecognized numeric codes of any length to `Unknown`.
+- Keep the headers-only path for empty responses. Header status 0 ends an empty server stream
+  successfully. An empty unary response still has no message and returns Tonic's missing-message
+  error. A nonzero HTTP-header status continues to reach the caller.
+
+Native tests use the workspace lock and exercise Tonic unary and streaming decoding, including
+split and truncated frames, delayed EOF, cancellation, trailing bytes, and malformed or unfamiliar
+status values. Run `cargo test --locked -p tonic-web-wasm-client` from the workspace root. CI uses
+the `vendored-tonic-web-wasm-client` job in `rust-checks.yml`.
+
+### Existing limitations
+
+- Tonic 0.14.3 gives HTTP-header status priority and can skip the body entirely. A conflicting
+  header and body status therefore still follows the header path. Header-only status validation
+  remains Tonic's responsibility.
+- Metadata other than `grpc-status` retains the existing last-value behavior for duplicates.
+  [Upstream #117](https://github.com/devashishdxt/tonic-web-wasm-client/pull/117) addresses that
+  separately. Error metadata still uses Tonic's existing decoding, including its panic on
+  invalid base64 in `grpc-status-details-bin`.
+- The checks target binary gRPC-web. The existing text/base64 path has a buffer bug and
+  compressed body trailers are unsupported. Frames are still buffered individually up to
+  their announced length.
 
 ## Not bumped to 0.9.2
 
@@ -85,9 +109,17 @@ Reported upstream as devashishdxt/tonic-web-wasm-client issue #99 (2026-09-25) w
 (same idea: end the body when the stream ends between frames with nothing buffered; unmerged, no
 reviews). Release 0.9.2 (2026-09-14) does not include it. Do not send our patch separately.
 
-## To remove
+## Reapplying the vendor changes
 
-Drop this directory, the `[patch.crates-io]` entry, the `exclude` entry and the CI job once both
-fixes are in an upstream release the pins allow. `trailers-only.patch` is a ready-made upstream
-change (apply with `patch -p1` from a `tonic-web-wasm-client` checkout); `trailers.patch` applies
-on top of it.
+From the published `tonic-web-wasm-client` 0.8.0 source root, apply the WebZjs patches in order.
+Set `webzjs_vendor` to the absolute path of this directory.
+
+```sh
+patch -p1 < "$webzjs_vendor/trailers-only.patch"
+patch -p1 < "$webzjs_vendor/trailers.patch"
+patch -p1 < "$webzjs_vendor/trailers-completion.patch"
+cp -R "$webzjs_vendor/src/response_body" src/
+```
+
+Drop this directory, the `[patch.crates-io]` entry, the `exclude` entry and the CI job once these
+fixes are in an upstream release the pins allow.

@@ -6,12 +6,17 @@
 
 use std::{
     future::Future,
-    pin::pin,
-    task::{Context, Poll, Waker},
+    pin::{pin, Pin},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
+    task::{Context, Poll, Wake, Waker},
 };
 
 use bytes::{Buf, BufMut, Bytes};
-use http::{HeaderMap, StatusCode};
+use futures_util::{stream, Stream, StreamExt};
+use http::{uri::PathAndQuery, HeaderMap, StatusCode};
 use http_body::Body;
 use tonic::{
     codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder, Streaming},
@@ -166,7 +171,7 @@ fn through_tonic_stream(body: ResponseBody) -> (Vec<Bytes>, Result<(), Status>) 
 }
 
 /// A gRPC service that answers every call with a fixed gRPC-web body and HTTP 200.
-struct FixedResponse(Option<ResponseBody>);
+struct FixedResponse(Option<ResponseBody>, HeaderMap);
 
 impl tower_service::Service<http::Request<tonic::body::Body>> for FixedResponse {
     type Response = http::Response<ResponseBody>;
@@ -179,16 +184,18 @@ impl tower_service::Service<http::Request<tonic::body::Body>> for FixedResponse 
 
     fn call(&mut self, _: http::Request<tonic::body::Body>) -> Self::Future {
         let body = self.0.take().expect("one call per test");
-        std::future::ready(Ok(http::Response::builder()
+        let mut response = http::Response::builder()
             .status(StatusCode::OK)
             .header(http::header::CONTENT_TYPE, CONTENT_TYPE)
             .body(body)
-            .expect("static response parts are valid")))
+            .expect("static response parts are valid");
+        response.headers_mut().extend(std::mem::take(&mut self.1));
+        std::future::ready(Ok(response))
     }
 }
 
 fn through_tonic_unary(body: ResponseBody) -> Result<Bytes, Status> {
-    let mut grpc = tonic::client::Grpc::new(FixedResponse(Some(body)));
+    let mut grpc = tonic::client::Grpc::new(FixedResponse(Some(body), HeaderMap::new()));
     let path = http::uri::PathAndQuery::from_static("/test.Service/Unary");
     run(grpc.unary(tonic::Request::new(Bytes::new()), path, RawCodec)).map(|r| r.into_inner())
 }
@@ -376,5 +383,291 @@ fn nothing_is_yielded_after_the_trailers() {
             std::pin::Pin::new(&mut body).poll_frame(&mut cx),
             Poll::Ready(None)
         ));
+    }
+}
+
+fn data_then_trailer(trailer: &[u8]) -> Vec<u8> {
+    [data_frame(b"hello"), trailer_frame(trailer)].concat()
+}
+
+fn assert_protocol_error(status: Status) {
+    assert_eq!(status.code(), Code::Unknown);
+    assert!(
+        status.message().contains("malformed response")
+            || status.message().contains("failed to parse headers"),
+        "{status:?}"
+    );
+}
+
+#[test]
+fn invalid_body_status_fails_both_tonic_paths() {
+    for trailers in [
+        &b"x-meta: present\r\n"[..],
+        b"grpc-status: 13\r\ngrpc-status: 0\r\n",
+        b"grpc-status: 0\r\nGrpc-Status: 0\r\n",
+        b"grpc-status: 0\r\n\r\nGrpc-Status: 13\r\n",
+        b"grpc-status:\r\n",
+        b"grpc-status: +0\r\n",
+        b"grpc-status: -1\r\n",
+        b"grpc-status: 0, 0\r\n",
+        b"grpc-status: 13junk\r\n",
+        b"grpc-status: 00\r\n",
+    ] {
+        let bytes = data_then_trailer(trailers);
+        let (messages, result) = through_tonic_stream(body(vec![bytes.clone()], false));
+        assert_eq!(messages, [Bytes::from_static(b"hello")]);
+        assert_protocol_error(result.expect_err("invalid body status ended the stream cleanly"));
+        assert_protocol_error(
+            through_tonic_unary(body(vec![bytes], false))
+                .expect_err("invalid body status produced a unary response"),
+        );
+    }
+}
+
+#[test]
+fn tonic_preserves_all_recognized_body_status_codes() {
+    for code in 0..=16 {
+        let trailers = format!("grpc-status: {code}\r\n");
+        let bytes = data_then_trailer(trailers.as_bytes());
+        let result = through_tonic_unary(body(vec![bytes], false));
+        if code == 0 {
+            assert_eq!(result.unwrap(), Bytes::from_static(b"hello"));
+        } else {
+            assert_eq!(result.unwrap_err().code(), Code::from_i32(code));
+        }
+    }
+}
+
+#[test]
+fn unfamiliar_body_status_maps_to_unknown_with_server_metadata() {
+    let oversized = "9".repeat(128);
+    for code in ["17", "4294967296", &oversized] {
+        let trailers = format!(
+            "grpc-status: {code}\r\ngrpc-message: newer%20code\r\n\
+             grpc-status-details-bin: AQID\r\nx-proof: retained\r\n"
+        );
+        let bytes = data_then_trailer(trailers.as_bytes());
+        let (messages, result) = through_tonic_stream(body(vec![bytes.clone()], false));
+        assert_eq!(messages, [Bytes::from_static(b"hello")]);
+        for status in [
+            result.unwrap_err(),
+            through_tonic_unary(body(vec![bytes], false)).unwrap_err(),
+        ] {
+            assert_eq!(status.code(), Code::Unknown);
+            assert_eq!(status.message(), "newer code");
+            assert_eq!(status.details(), [1, 2, 3]);
+            assert_eq!(status.metadata().get("x-proof").unwrap(), "retained");
+        }
+    }
+}
+
+#[test]
+fn bytes_after_body_trailer_fail_even_after_an_ok_status() {
+    let initial = data_then_trailer(STATUS_0);
+    for tail in [vec![0xff], data_frame(b"extra"), trailer_frame(STATUS_5)] {
+        for chunks in [
+            vec![[initial.clone(), tail.clone()].concat()],
+            vec![initial.clone(), tail],
+        ] {
+            let (messages, result) = through_tonic_stream(body(chunks.clone(), false));
+            assert_eq!(messages, [Bytes::from_static(b"hello")]);
+            assert_protocol_error(result.expect_err("trailing bytes ended the stream cleanly"));
+            assert_protocol_error(
+                through_tonic_unary(body(chunks, false))
+                    .expect_err("trailing bytes produced a unary response"),
+            );
+        }
+    }
+}
+
+#[test]
+fn truncated_data_or_trailer_does_not_erase_preceding_message() {
+    for next in [data_frame(b"more"), trailer_frame(STATUS_0)] {
+        for cut in [1, 4, 5, next.len() - 1] {
+            let bytes = [data_frame(b"hello"), next[..cut].to_vec()].concat();
+            let (messages, result) = through_tonic_stream(body(vec![bytes], false));
+            assert_eq!(messages, [Bytes::from_static(b"hello")]);
+            assert_protocol_error(result.expect_err("truncation ended the stream cleanly"));
+        }
+    }
+}
+
+#[derive(Default)]
+struct TailState {
+    completion: Option<Result<(), Error>>,
+    waker: Option<Waker>,
+    polls: usize,
+    dropped: bool,
+}
+
+struct ControlledTail(Arc<Mutex<TailState>>);
+
+impl Stream for ControlledTail {
+    type Item = Result<Bytes, Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut state = self.0.lock().unwrap();
+        state.polls += 1;
+        match state.completion.take() {
+            Some(Ok(())) => Poll::Ready(None),
+            Some(Err(error)) => Poll::Ready(Some(Err(error))),
+            None => {
+                state.waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
+}
+
+impl Drop for ControlledTail {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().dropped = true;
+    }
+}
+
+fn body_with_controlled_tail() -> (ResponseBody, Arc<Mutex<TailState>>) {
+    let state = Arc::new(Mutex::new(TailState::default()));
+    let first = Ok(Bytes::from(data_then_trailer(STATUS_0)));
+    let source = stream::iter([first]).chain(ControlledTail(state.clone()));
+    let body = ResponseBody::from_body_stream(BodyStream::from_stream(source), CONTENT_TYPE, false)
+        .unwrap();
+    (body, state)
+}
+
+fn complete_tail(state: &Mutex<TailState>, result: Result<(), Error>) {
+    let waker = {
+        let mut state = state.lock().unwrap();
+        state.completion = Some(result);
+        state.waker.take().expect("the body is waiting on its tail")
+    };
+    waker.wake();
+}
+
+#[derive(Default)]
+struct WakeCount(AtomicUsize);
+
+impl Wake for WakeCount {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn streaming_message_arrives_before_eof_but_final_success_waits() {
+    let (body, tail) = body_with_controlled_tail();
+    let mut stream = Streaming::new_response(RawCodec, body, StatusCode::OK, None, None);
+    assert_eq!(
+        run(stream.message()).unwrap(),
+        Some(Bytes::from_static(b"hello"))
+    );
+    assert_eq!(tail.lock().unwrap().polls, 0);
+
+    let count = Arc::new(WakeCount::default());
+    let waker = Waker::from(count.clone());
+    let mut cx = Context::from_waker(&waker);
+    let mut completion = pin!(stream.message());
+    assert!(completion.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(tail.lock().unwrap().polls, 1);
+    assert_eq!(count.0.load(Ordering::Relaxed), 0);
+
+    complete_tail(&tail, Ok(()));
+    assert_eq!(count.0.load(Ordering::Relaxed), 1);
+    assert!(matches!(
+        completion.as_mut().poll(&mut cx),
+        Poll::Ready(Ok(None))
+    ));
+}
+
+#[test]
+fn unary_result_waits_for_eof() {
+    let (body, tail) = body_with_controlled_tail();
+    let mut grpc = tonic::client::Grpc::new(FixedResponse(Some(body), HeaderMap::new()));
+    let path = PathAndQuery::from_static("/test.Service/Unary");
+    let mut result = pin!(grpc.unary(tonic::Request::new(Bytes::new()), path, RawCodec));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(result.as_mut().poll(&mut cx).is_pending());
+    complete_tail(&tail, Ok(()));
+    let Poll::Ready(Ok(response)) = result.as_mut().poll(&mut cx) else {
+        panic!("clean EOF should finish the unary call");
+    };
+    assert_eq!(response.into_inner(), Bytes::from_static(b"hello"));
+}
+
+#[test]
+fn transport_error_after_complete_trailer_reaches_tonic() {
+    let initial = Bytes::from(data_then_trailer(STATUS_0));
+    let failure = || {
+        Err(Error::JsError(
+            "connection closed while reading body".into(),
+        ))
+    };
+    let make_body = || {
+        ResponseBody::from_body_stream(
+            BodyStream::from_stream(stream::iter([Ok(initial.clone()), failure()])),
+            CONTENT_TYPE,
+            false,
+        )
+        .unwrap()
+    };
+    let (messages, result) = through_tonic_stream(make_body());
+    assert_eq!(messages, [Bytes::from_static(b"hello")]);
+    for status in [
+        result.unwrap_err(),
+        through_tonic_unary(make_body()).unwrap_err(),
+    ] {
+        assert!(
+            status
+                .message()
+                .contains("connection closed while reading body"),
+            "{status:?}"
+        );
+    }
+}
+
+#[test]
+fn cancelling_while_waiting_for_eof_drops_the_source() {
+    let (body, tail) = body_with_controlled_tail();
+    let mut stream = Streaming::new_response(RawCodec, body, StatusCode::OK, None, None);
+    assert!(run(stream.message()).unwrap().is_some());
+    let mut cx = Context::from_waker(Waker::noop());
+    {
+        let mut completion = pin!(stream.message());
+        assert!(completion.as_mut().poll(&mut cx).is_pending());
+        assert!(!tail.lock().unwrap().dropped);
+    }
+    drop(stream);
+    let state = tail.lock().unwrap();
+    assert!(state.dropped);
+    assert_eq!(state.polls, 1);
+}
+
+#[test]
+fn tonic_handles_headers_only_without_an_extra_body_trailer() {
+    let request = || tonic::Request::new(Bytes::new());
+    let path = PathAndQuery::from_static("/test.Service/Call");
+    for (value, code) in [("0", Code::Ok), ("5", Code::NotFound)] {
+        let client = || {
+            let mut headers = HeaderMap::new();
+            headers.insert("grpc-status", http::HeaderValue::from_static(value));
+            headers.insert(
+                "grpc-message",
+                http::HeaderValue::from_static("header%20status"),
+            );
+            tonic::client::Grpc::new(FixedResponse(Some(body(vec![], true)), headers))
+        };
+        let streaming = run(client().server_streaming(request(), path.clone(), RawCodec));
+        let unary = run(client().unary(request(), path.clone(), RawCodec)).unwrap_err();
+        if code == Code::Ok {
+            let mut stream = streaming.unwrap().into_inner();
+            assert_eq!(run(stream.message()).unwrap(), None);
+            assert_eq!(unary.code(), Code::Internal);
+            assert_eq!(unary.message(), "Missing response message.");
+        } else {
+            let status = streaming.unwrap_err();
+            assert_eq!(status.code(), code);
+            assert_eq!(status.message(), "header status");
+            assert_eq!(unary.code(), code);
+            assert_eq!(unary.message(), "header status");
+        }
     }
 }
